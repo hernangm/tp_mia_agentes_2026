@@ -11,10 +11,11 @@ Los tests de conformidad en `tests/conformance/test_m1.py` y
 
 from __future__ import annotations
 
+import json
 from typing import Any, Callable
 
 from mia_agents.protocols import LLMClient
-from mia_agents.types import AgentResult, ToolSchema
+from mia_agents.types import AgentResult, AgentStep, ToolSchema
 
 
 class MyAgent:
@@ -48,7 +49,11 @@ class MyAgent:
         self._system = system_prompt
         self._max_iterations = max_iterations
         self._max_history_messages = max_history_messages
-        # TODO (M1): inicializa el estado interno para las herramientas registradas.
+        # Dos diccionarios indexados por schema.name: uno guarda el callable, otro el esquema.
+        # Separarlos evita acoplar el despacho de herramientas a la búsqueda del esquema —
+        # register_tool escribe en ambos; run lee _tools para invocar y _schemas para exponer al LLM.
+        self._tools: dict[str, Callable[..., str]] = {}
+        self._schemas: dict[str, ToolSchema] = {}
         # TODO (M2): inicializa la estructura de historial conversacional.
 
     def register_tool(
@@ -65,7 +70,10 @@ class MyAgent:
         El callable se invoca con kwargs que coinciden con la firma.
         Debe devolver una cadena.
         """
-        raise NotImplementedError("M1: implementa el registro de herramientas")
+        # schema.name es la clave que el LLM usará en tool_call.name — usarla como clave del registro
+        # hace que el despacho en run() sea una búsqueda directa en el dict sin traducción de nombres.
+        self._tools[schema.name] = tool
+        self._schemas[schema.name] = schema
 
     def run(self, user_message: str) -> AgentResult:
         """Ejecuta el bucle del agente hasta una respuesta final o hasta max_iterations.
@@ -91,7 +99,70 @@ class MyAgent:
         `LLMResponse` y exponlos en `AgentResult.input_tokens` /
         `AgentResult.output_tokens`.
         """
-        raise NotImplementedError("M1: implementa el bucle del agente")
+        messages: list[dict] = [{"role": "user", "content": user_message}]
+        steps: list = []
+        # Acumuladores de tokens: arrancan en None y pasan a int en cuanto algún LLMResponse reporta tokens.
+        # Así respetamos el contrato de AgentResult: None significa "no se reportaron tokens", no "cero tokens".
+        total_input: int | None = None
+        total_output: int | None = None
+
+        for _ in range(self._max_iterations):
+            resp = self._llm.chat(
+                messages=messages,
+                tools=list(self._schemas.values()) if self._schemas else None,
+                system=self._system,
+            )
+
+            # Se suman los tokens de cada turno; (x or 0) trata None como 0 sin cambiar el tipo del acumulador.
+            if resp.input_tokens is not None:
+                total_input = (total_input or 0) + resp.input_tokens
+            if resp.output_tokens is not None:
+                total_output = (total_output or 0) + resp.output_tokens
+
+            # Sin tool_calls: el LLM produjo una respuesta final en texto — el bucle termina aquí.
+            # Esta es la única condición de parada válida en M1; final_result pertenece a M2.
+            if not resp.tool_calls:
+                return AgentResult(answer=resp.content or "", steps=steps,
+                                   input_tokens=total_input, output_tokens=total_output)
+
+            # Se agrega el turno del asistente con tool_calls serializados al formato dict que espera
+            # _normalize_messages del scaffold: {"id": ..., "function": {"name": ..., "arguments": ...}}.
+            # Pasar objetos ToolCall directamente falla porque el scaffold llama .get() sobre cada elemento.
+            messages.append({
+                "role": "assistant",
+                "content": resp.content,
+                "tool_calls": [
+                    {"id": tc.id, "function": {"name": tc.name, "arguments": tc.arguments}}
+                    for tc in resp.tool_calls
+                ],
+            })
+
+            # Se despacha cada tool_call y se recolectan los resultados.
+            for tool_call in resp.tool_calls:
+                if tool_call.name not in self._tools:
+                    # Herramienta desconocida: se registra el error pero el bucle continúa — nunca crashear por alucinaciones del LLM.
+                    steps.append(AgentStep(
+                        tool_name=tool_call.name,
+                        tool_input=tool_call.arguments,
+                        tool_output=None,
+                        error=f"Herramienta desconocida: {tool_call.name}",
+                    ))
+                    tool_output = f"Error: herramienta desconocida '{tool_call.name}'"
+                else:
+                    kwargs = json.loads(tool_call.arguments)
+                    tool_output = self._tools[tool_call.name](**kwargs)
+                    steps.append(AgentStep(
+                        tool_name=tool_call.name,
+                        tool_input=tool_call.arguments,
+                        tool_output=tool_output,
+                        error=None,
+                    ))
+
+                # Se vuelca el resultado para que el LLM pueda razonar sobre él en el próximo turno.
+                messages.append({"role": "tool", "content": tool_output, "tool_call_id": tool_call.id})
+
+        # Se alcanzó max_iterations sin respuesta de texto — se retorna lo que hay en lugar de loopear indefinidamente.
+        return AgentResult(answer="", steps=steps, input_tokens=total_input, output_tokens=total_output)
 
     def structured_call(
         self,
