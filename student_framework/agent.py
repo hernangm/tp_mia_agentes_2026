@@ -40,17 +40,11 @@ class MyAgent:
         max_iterations : int
             Tope de iteraciones del bucle del agente (M1).
         max_history_messages : int
-            Número máximo de mensajes que se permiten en la lista
-            `messages` enviada al LLM en una única llamada. En M1 este
-            valor es ignorado; el agente sólo necesita aceptarlo en su
-            constructor. En M2 deben respetarlo: la longitud de la
-            lista de mensajes pasada a `self._llm.chat(...)` no puede
-            superar este número en ninguna llamada, sin importar la
-            estrategia de memoria que elijan.
+            Tope de mensajes en la lista enviada a `self._llm.chat(...)`
+            en cada llamada (nunca se supera, sea cual sea la iteración).
         context_policy : ContextPolicy | None
-            Estrategia de acotado del contexto (D-05). Si no se provee,
-            se usa `SlidingWindowContextPolicy()` (ventana deslizante con
-            pairing atómico de tool_call/tool_result por defecto).
+            Estrategia de acotado del contexto (D-05). Por defecto,
+            `SlidingWindowContextPolicy()`.
         """
         self._llm = llm_client
         self._system = system_prompt
@@ -61,10 +55,8 @@ class MyAgent:
         # register_tool escribe en ambos; run lee _tools para invocar y _schemas para exponer al LLM.
         self._tools: dict[str, Callable[..., str]] = {}
         self._schemas: dict[str, ToolSchema] = {}
-        # M2 (SESS-01/CTX-01): self._context_policy decide QUÉ se manda en cada
-        # llamada a chat(); self._context es la memoria COMPLETA de la instancia,
-        # nunca truncada desde afuera (D-01) — persiste entre llamadas a run(),
-        # a diferencia de la variable local `messages` que usaba M1.
+        # self._context: memoria completa, nunca truncada (D-01).
+        # self._context_policy: decide qué sublista se manda en cada chat().
         self._context_policy: ContextPolicy = context_policy or SlidingWindowContextPolicy()
         self._context: list[dict] = []
 
@@ -111,27 +103,17 @@ class MyAgent:
         `LLMResponse` y exponlos en `AgentResult.input_tokens` /
         `AgentResult.output_tokens`.
         """
-        # M2 (SESS-01/D-01): se apenda a self._context, la memoria persistente
-        # de la instancia — nunca se reemplaza por una lista local nueva como
-        # en M1, para que el próximo run() vea lo que pasó en este.
+        # Se persiste en self._context, no en variable local (SESS-01/D-01).
         self._context.append({"role": "user", "content": user_message})
         steps: list = []
-        # Acumuladores de tokens: LOCALES a este run(), re-inicializados en None
-        # en cada llamada — NO se mueven a self._* aunque el resto del método sí
-        # se volvió estatal. AgentResult.input_tokens/output_tokens documentan
-        # "totales de ESTA llamada a run()", no un acumulado de toda la sesión;
-        # estatalizarlos junto con el contexto rompería test_token_accounting en
-        # cuanto se invoque run() más de una vez sobre la misma instancia (CTX-02).
+        # Locales a este run(), no self._*: input_tokens/output_tokens son el
+        # total de ESTA llamada, no un acumulado de toda la sesión (CTX-02).
         total_input: int | None = None
         total_output: int | None = None
 
         for _ in range(self._max_iterations):
-            # CTX-01: el tope de max_history_messages debe respetarse en TODA
-            # llamada a chat(), no solo en la primera del turno — por eso
-            # handle_context() se invoca dentro del for, en cada iteración,
-            # nunca una sola vez antes del loop. self._context nunca se acota
-            # in-place: handle_context devuelve la sublista a enviar, y la
-            # memoria completa queda intacta para la próxima iteración/run().
+            # Se acota en cada iteración, no solo antes del loop, porque el
+            # tope debe valer en toda llamada a chat() (CTX-01).
             bounded = self._context_policy.handle_context(
                 self._context, self._max_history_messages
             )

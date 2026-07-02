@@ -14,6 +14,7 @@ from mia_agents.llm_client import LLMClient
 from mia_agents.protocols import Agent
 
 from .agent import MyAgent
+from .context_policy import SlidingWindowContextPolicy
 
 
 def build_agent(config: dict[str, Any] | None = None) -> Agent:
@@ -34,18 +35,12 @@ def build_agent(config: dict[str, Any] | None = None) -> Agent:
     if "max_history_messages" in config:
         kwargs["max_history_messages"] = config["max_history_messages"]
 
-    # D-05: misma cadena de precedencia que la inyección de llm_client de
-    # arriba ("instancia explícita gana, si no se arma un default razonable,
-    # si no se deja el default del constructor"). Una ContextPolicy
-    # pre-construida gana siempre; si no vino ninguna pero sí `atomic_turns`,
-    # se arma el SlidingWindowContextPolicy por defecto con ese flag; si no
-    # vino ninguno de los dos, no se pasa kwargs["context_policy"] — el
-    # constructor de MyAgent ya default-ea a SlidingWindowContextPolicy(atomic_turns=True).
+    # D-05: misma precedencia que llm_client arriba — instancia explícita
+    # gana, si no arma un default con atomic_turns, si no deja el default
+    # del constructor (SlidingWindowContextPolicy(atomic_turns=True)).
     if "context_policy" in config:
         kwargs["context_policy"] = config["context_policy"]
     elif "atomic_turns" in config:
-        from student_framework.context_policy import SlidingWindowContextPolicy
-
         kwargs["context_policy"] = SlidingWindowContextPolicy(
             atomic_turns=config["atomic_turns"]
         )

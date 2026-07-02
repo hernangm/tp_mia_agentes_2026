@@ -117,6 +117,9 @@ def test_tiny_budget_fallback() -> None:
     # CTX-01 es innegociable: el resultado nunca supera max_messages, aunque
     # eso implique romper el pairing en este caso degenerado (D-04).
     assert len(bounded) <= 2
+    # Pero nunca debe empezar con un tool_result huérfano (sin su tool_call
+    # en la misma ventana) -- eso rompe la Converse API real, no solo el pairing.
+    assert not bounded or bounded[0].get("role") != "tool"
 
 
 # ---------------------------------------------------------------------------
