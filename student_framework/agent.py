@@ -12,12 +12,26 @@ Los tests de conformidad en `tests/conformance/test_m1.py` y
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Callable
 
 from mia_agents.protocols import LLMClient
 from mia_agents.types import AgentResult, AgentStep, ToolSchema
 
 from student_framework.context_policy import ContextPolicy, SlidingWindowContextPolicy
+
+# Reintentos de tools fallidas (ERR-01): 1 intento inicial + 2 reintentos = 3 intentos
+# totales. Se fija como constante de módulo (no como parámetro de MyAgent ni de
+# build_agent) porque el requerimiento lo deja explícitamente fuera de alcance como
+# configurable — un valor fijo es una decisión de diseño, no una perilla del usuario.
+# El valor 3 espeja `max_repair_attempts=2` de structured_call (1 + 2), manteniendo
+# consistencia entre los dos mecanismos de reintento del agente.
+MAX_TOOL_ATTEMPTS = 3
+# Base del backoff exponencial en segundos: el intento N espera
+# RETRY_BACKOFF_BASE * 2**N antes del siguiente intento. Un valor chico (0.1s)
+# mantiene los tests rápidos sin monkeypatch y evita que una tool lenta bloquee
+# el loop por mucho tiempo (mitiga T-02-01: DoS por reintentos sin cota).
+RETRY_BACKOFF_BASE = 0.1
 
 
 class MyAgent:
@@ -159,14 +173,64 @@ class MyAgent:
                     ))
                     tool_output = f"Error: herramienta desconocida '{tool_call.name}'"
                 else:
-                    kwargs = json.loads(tool_call.arguments)
-                    tool_output = self._tools[tool_call.name](**kwargs)
+                    tool_output = None
+                    error_msg = None
+
+                    # Parseo de argumentos UNA sola vez, fuera del loop de reintentos.
+                    # Un JSON malformado es un error determinístico: el mismo texto
+                    # produce el mismo fallo en cada intento, así que reintentarlo solo
+                    # quemaría intentos y sleeps sin cambiar el resultado (T-02-03). Se
+                    # falla rápido en vez de tratarlo como un fallo transitorio de tool.
+                    try:
+                        kwargs = json.loads(tool_call.arguments)
+                    except Exception as exc:
+                        error_msg = (
+                            f"Argumentos inválidos para '{tool_call.name}': "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+
+                    if error_msg is None:
+                        # Reintentos con backoff exponencial (ERR-01): la tool puede
+                        # fallar por causas transitorias (red, rate limit, etc.), a
+                        # diferencia del parseo de argumentos. El loop termina de dos
+                        # formas: éxito -> break inmediato (no seguimos gastando
+                        # intentos); agotamiento -> cae fuera del for con error_msg
+                        # seteado y el turno continúa (ERR-02) en vez de propagar la
+                        # excepción y tirar abajo run().
+                        for attempt in range(MAX_TOOL_ATTEMPTS):
+                            try:
+                                tool_output = self._tools[tool_call.name](**kwargs)
+                                error_msg = None
+                                break
+                            except Exception as exc:
+                                # Mensaje legible con tipo + str(exc) — NUNCA
+                                # traceback.format_exc(): un stack trace expondría
+                                # rutas internas del sistema al modelo/usuario
+                                # (mitiga T-02-02, ERR-03).
+                                error_msg = (
+                                    f"La herramienta '{tool_call.name}' falló tras "
+                                    f"{attempt + 1} intento(s): {type(exc).__name__}: {exc}"
+                                )
+                                tool_output = None
+                                # Backoff SOLO entre intentos, nunca después del último
+                                # (evitaría un sleep inútil antes de degradar).
+                                if attempt < MAX_TOOL_ATTEMPTS - 1:
+                                    time.sleep(RETRY_BACKOFF_BASE * (2 ** attempt))
+
                     steps.append(AgentStep(
                         tool_name=tool_call.name,
                         tool_input=tool_call.arguments,
                         tool_output=tool_output,
-                        error=None,
+                        error=error_msg,
                     ))
+
+                    if error_msg is not None:
+                        # El LLM debe VER el fallo para poder razonar sobre él en el
+                        # próximo turno (p. ej. reintentar con otros argumentos o
+                        # informar al usuario) — la observación role:tool lleva el
+                        # mensaje legible, nunca None (ERR-02, ERR-04: el fallo queda
+                        # visible tanto en AgentStep.error como en el historial).
+                        tool_output = error_msg
 
                 # Se vuelca el resultado para que el LLM pueda razonar sobre él en el próximo turno.
                 self._context.append({"role": "tool", "content": tool_output, "tool_call_id": tool_call.id})
