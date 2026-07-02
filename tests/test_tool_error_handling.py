@@ -137,6 +137,42 @@ def test_tool_exhausts_retries_readable_error(monkeypatch: pytest.MonkeyPatch) -
     assert sleeps == [RETRY_BACKOFF_BASE, RETRY_BACKOFF_BASE * 2]
 
 
+@pytest.mark.parametrize(
+    "bad_arguments",
+    ["not json", json.dumps([1, 2, 3])],
+    ids=["invalid-json-syntax", "non-dict-json-shape"],
+)
+def test_malformed_tool_arguments_fail_fast_without_retry(
+    monkeypatch: pytest.MonkeyPatch, bad_arguments: str
+) -> None:
+    """T-02-03: JSON inválido o de forma no-mapping no se reintenta -- falla rápido."""
+    sleeps: list[float] = []
+    monkeypatch.setattr(
+        "student_framework.agent.time.sleep", lambda delay: sleeps.append(delay)
+    )
+
+    tool = _FlakyTool(fail_times=0)  # tendría éxito si llegara a invocarse
+    schema = _make_flaky_schema()
+    mock = MockLLMClient(
+        [
+            LLMResponse(
+                content=None,
+                tool_calls=[ToolCall(id="c1", name="flaky_tool", arguments=bad_arguments)],
+            ),
+            LLMResponse(content="respuesta final"),
+        ]
+    )
+    agent = build_agent({"llm_client": mock})
+    agent.register_tool(tool, schema)
+
+    result = agent.run("dispara la tool con argumentos rotos")
+
+    assert tool.calls == 0  # nunca se invoca -- falla antes de llegar a la tool
+    assert sleeps == []  # sin backoff -- no es un fallo transitorio
+    assert result.steps[0].error is not None
+    assert "Argumentos inválidos" in result.steps[0].error
+
+
 def test_run_continues_after_tool_failure() -> None:
     """ERR-02/ERR-04: una tool_call agotada no aborta el resto del turno."""
     tool = _FlakyTool(always=True)

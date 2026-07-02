@@ -86,7 +86,9 @@ class MyAgent:
         aplica `to_llm_spec()` al llamar al proveedor.
 
         El callable se invoca con kwargs que coinciden con la firma.
-        Debe devolver una cadena.
+        Debe devolver una cadena. Debe ser idempotente/sin side-effects
+        relevantes: `run()` puede reintentarlo hasta `MAX_TOOL_ATTEMPTS`
+        veces si lanza una excepción.
         """
         # schema.name es la clave que el LLM usará en tool_call.name — usarla como clave del registro
         # hace que el despacho en run() sea una búsqueda directa en el dict sin traducción de nombres.
@@ -176,13 +178,14 @@ class MyAgent:
                     tool_output = None
                     error_msg = None
 
-                    # Parseo de argumentos UNA sola vez, fuera del loop de reintentos.
-                    # Un JSON malformado es un error determinístico: el mismo texto
-                    # produce el mismo fallo en cada intento, así que reintentarlo solo
-                    # quemaría intentos y sleeps sin cambiar el resultado (T-02-03). Se
-                    # falla rápido en vez de tratarlo como un fallo transitorio de tool.
+                    # JSON inválido o con forma no-mapping: error determinístico, mismo
+                    # resultado en cada intento -> se falla rápido, sin retry (T-02-03).
                     try:
                         kwargs = json.loads(tool_call.arguments)
+                        if not isinstance(kwargs, dict):
+                            raise TypeError(
+                                f"se esperaba un objeto JSON, se recibió {type(kwargs).__name__}"
+                            )
                     except Exception as exc:
                         error_msg = (
                             f"Argumentos inválidos para '{tool_call.name}': "
@@ -190,31 +193,23 @@ class MyAgent:
                         )
 
                     if error_msg is None:
-                        # Reintentos con backoff exponencial (ERR-01): la tool puede
-                        # fallar por causas transitorias (red, rate limit, etc.), a
-                        # diferencia del parseo de argumentos. El loop termina de dos
-                        # formas: éxito -> break inmediato (no seguimos gastando
-                        # intentos); agotamiento -> cae fuera del for con error_msg
-                        # seteado y el turno continúa (ERR-02) en vez de propagar la
-                        # excepción y tirar abajo run().
+                        # Retry con backoff exponencial (ERR-01): fallo transitorio de
+                        # tool, no de parseo. Éxito -> break; agotamiento -> error_msg
+                        # queda seteado y el turno sigue (ERR-02), sin propagar la excepción.
                         for attempt in range(MAX_TOOL_ATTEMPTS):
                             try:
                                 tool_output = self._tools[tool_call.name](**kwargs)
                                 error_msg = None
                                 break
                             except Exception as exc:
-                                # Mensaje legible con tipo + str(exc) — NUNCA
-                                # traceback.format_exc(): un stack trace expondría
-                                # rutas internas del sistema al modelo/usuario
-                                # (mitiga T-02-02, ERR-03).
+                                # Tipo + str(exc), nunca traceback.format_exc() — no
+                                # exponer rutas internas al modelo/usuario (ERR-03).
                                 error_msg = (
                                     f"La herramienta '{tool_call.name}' falló tras "
                                     f"{attempt + 1} intento(s): {type(exc).__name__}: {exc}"
                                 )
                                 tool_output = None
-                                # Backoff SOLO entre intentos, nunca después del último
-                                # (evitaría un sleep inútil antes de degradar).
-                                if attempt < MAX_TOOL_ATTEMPTS - 1:
+                                if attempt < MAX_TOOL_ATTEMPTS - 1:  # sin sleep tras el último intento
                                     time.sleep(RETRY_BACKOFF_BASE * (2 ** attempt))
 
                     steps.append(AgentStep(
