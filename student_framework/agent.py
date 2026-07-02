@@ -16,6 +16,7 @@ import time
 from typing import Any, Callable
 
 from mia_agents.protocols import LLMClient
+from mia_agents.tool_schema import FINAL_RESULT_TOOL_NAME, final_result_tool_schema
 from mia_agents.types import AgentResult, AgentStep, ToolSchema
 
 from student_framework.context_policy import ContextPolicy, SlidingWindowContextPolicy
@@ -260,4 +261,125 @@ class MyAgent:
 
         El M1 deja esto como stub; los tests de M2 verifican el contrato.
         """
-        raise NotImplementedError("M2: implementa salida estructurada con reparación")
+        # SESS-02: se reutiliza self._context (la MISMA memoria que usa run()), no una
+        # lista local — así una llamada a structured_call() posterior (o un run()) ve
+        # este prompt en el historial compartido de la instancia.
+        self._context.append({"role": "user", "content": prompt})
+
+        # El ToolSchema sintético se deriva UNA sola vez del schema pydantic; se ofrece
+        # en cada chat() de este método y nunca junto a self._schemas (STRUCT-01): el
+        # LLM no debe poder invocar herramientas de negocio durante una llamada estructurada.
+        final_tool = final_result_tool_schema(schema)
+
+        # Se recuerda el último motivo de fallo para poder incluirlo en el mensaje de
+        # excepción si se agotan los intentos (T-03-03: mensaje legible, sin traceback).
+        last_error: str | None = None
+
+        # max_repair_attempts cuenta REPARACIONES, no intentos totales (a diferencia de
+        # MAX_TOOL_ATTEMPTS de run(), que cuenta intentos totales). Por eso el rango es
+        # max_repair_attempts + 1: 1 llamada inicial + N reparaciones = N+1 llamadas a
+        # chat() como máximo. Con max_repair_attempts=2 esto da exactamente 3 chat().
+        for _ in range(max_repair_attempts + 1):
+            # Se acota el historial en cada intento, igual que run() (CTX-01) — el tope
+            # de max_history_messages vale también dentro de structured_call.
+            bounded = self._context_policy.handle_context(
+                self._context, self._max_history_messages
+            )
+            resp = self._llm.chat(
+                messages=bounded,
+                tools=[final_tool],
+                system=self._system,
+            )
+
+            # Se busca específicamente un tool_call a "final_result"; cualquier otro
+            # nombre (alucinado) o texto libre sin tool_calls se trata como fallo.
+            final_call = next(
+                (tc for tc in (resp.tool_calls or []) if tc.name == FINAL_RESULT_TOOL_NAME),
+                None,
+            )
+
+            if final_call is None:
+                # STRUCT-02/03: el modelo no cerró con final_result — texto libre o una
+                # tool_call a otro nombre. No hay nada que validar; se arma reparación.
+                last_error = (
+                    "El modelo no llamó a final_result; respondió con texto libre "
+                    "o una tool incorrecta."
+                )
+                # Se vuelca el turno del asistente tal cual lo vio el modelo, con los
+                # tool_calls serializados al mismo formato dict que usa run() (para que
+                # _normalize_messages del scaffold los pueda leer sin traducción extra).
+                self._context.append({
+                    "role": "assistant",
+                    "content": resp.content,
+                    "tool_calls": [
+                        {"id": tc.id, "function": {"name": tc.name, "arguments": tc.arguments}}
+                        for tc in (resp.tool_calls or [])
+                    ],
+                })
+                self._context.append({
+                    "role": "user",
+                    "content": (
+                        f"{last_error} Debés cerrar SIEMPRE invocando la herramienta "
+                        f"'{FINAL_RESULT_TOOL_NAME}' con argumentos válidos según el schema."
+                    ),
+                })
+                continue
+
+            # Se encontró un tool_call a final_result: intentar parsear y validar.
+            try:
+                args = json.loads(final_call.arguments)
+                parsed = schema.model_validate(args)
+            except Exception as exc:
+                # STRUCT-03: JSON inválido o validación de schema fallida. Se responde
+                # el tool_call con una observación role:tool (igual que run() responde
+                # cada tool_call) para que el modelo vea el error puntual, y se agrega
+                # un mensaje de reparación pidiendo argumentos corregidos.
+                last_error = f"{type(exc).__name__}: {exc}"
+                self._context.append({
+                    "role": "assistant",
+                    "content": resp.content,
+                    "tool_calls": [
+                        {"id": tc.id, "function": {"name": tc.name, "arguments": tc.arguments}}
+                        for tc in (resp.tool_calls or [])
+                    ],
+                })
+                self._context.append({
+                    "role": "tool",
+                    "content": last_error,
+                    "tool_call_id": final_call.id,
+                })
+                self._context.append({
+                    "role": "user",
+                    "content": (
+                        f"Los argumentos de '{FINAL_RESULT_TOOL_NAME}' no son válidos: "
+                        f"{last_error}. Volvé a invocar '{FINAL_RESULT_TOOL_NAME}' con "
+                        "argumentos corregidos que cumplan el schema."
+                    ),
+                })
+                continue
+
+            # Éxito (STRUCT-02): se persiste el turno ganador en self._context (sin
+            # mensaje de reparación) para que quede disponible en la próxima llamada
+            # sobre esta instancia (SESS-02), y se retorna la instancia validada.
+            self._context.append({
+                "role": "assistant",
+                "content": resp.content,
+                "tool_calls": [
+                    {"id": tc.id, "function": {"name": tc.name, "arguments": tc.arguments}}
+                    for tc in (resp.tool_calls or [])
+                ],
+            })
+            self._context.append({
+                "role": "tool",
+                "content": "final_result recibido y validado.",
+                "tool_call_id": final_call.id,
+            })
+            return parsed
+
+        # STRUCT-04: se agotaron max_repair_attempts reparaciones sin una respuesta
+        # válida. Se levanta una excepción limpia (nunca None, nunca una instancia
+        # parcial) llevando el último motivo de fallo, sin traceback interno (T-03-03).
+        raise ValueError(
+            f"structured_call agotó {max_repair_attempts} reparación(es) sin una "
+            f"respuesta válida: {last_error}"
+        )
