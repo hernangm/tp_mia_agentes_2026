@@ -17,6 +17,8 @@ from typing import Any, Callable
 from mia_agents.protocols import LLMClient
 from mia_agents.types import AgentResult, AgentStep, ToolSchema
 
+from student_framework.context_policy import ContextPolicy, SlidingWindowContextPolicy
+
 
 class MyAgent:
     def __init__(
@@ -25,6 +27,7 @@ class MyAgent:
         system_prompt: str = "Eres un asistente útil.",
         max_iterations: int = 10,
         max_history_messages: int = 50,
+        context_policy: ContextPolicy | None = None,
     ) -> None:
         """Inicializa el agente.
 
@@ -44,6 +47,10 @@ class MyAgent:
             lista de mensajes pasada a `self._llm.chat(...)` no puede
             superar este número en ninguna llamada, sin importar la
             estrategia de memoria que elijan.
+        context_policy : ContextPolicy | None
+            Estrategia de acotado del contexto (D-05). Si no se provee,
+            se usa `SlidingWindowContextPolicy()` (ventana deslizante con
+            pairing atómico de tool_call/tool_result por defecto).
         """
         self._llm = llm_client
         self._system = system_prompt
@@ -54,7 +61,12 @@ class MyAgent:
         # register_tool escribe en ambos; run lee _tools para invocar y _schemas para exponer al LLM.
         self._tools: dict[str, Callable[..., str]] = {}
         self._schemas: dict[str, ToolSchema] = {}
-        # TODO (M2): inicializa la estructura de historial conversacional.
+        # M2 (SESS-01/CTX-01): self._context_policy decide QUÉ se manda en cada
+        # llamada a chat(); self._context es la memoria COMPLETA de la instancia,
+        # nunca truncada desde afuera (D-01) — persiste entre llamadas a run(),
+        # a diferencia de la variable local `messages` que usaba M1.
+        self._context_policy: ContextPolicy = context_policy or SlidingWindowContextPolicy()
+        self._context: list[dict] = []
 
     def register_tool(
         self,
@@ -99,16 +111,32 @@ class MyAgent:
         `LLMResponse` y exponlos en `AgentResult.input_tokens` /
         `AgentResult.output_tokens`.
         """
-        messages: list[dict] = [{"role": "user", "content": user_message}]
+        # M2 (SESS-01/D-01): se apenda a self._context, la memoria persistente
+        # de la instancia — nunca se reemplaza por una lista local nueva como
+        # en M1, para que el próximo run() vea lo que pasó en este.
+        self._context.append({"role": "user", "content": user_message})
         steps: list = []
-        # Acumuladores de tokens: arrancan en None y pasan a int en cuanto algún LLMResponse reporta tokens.
-        # Así respetamos el contrato de AgentResult: None significa "no se reportaron tokens", no "cero tokens".
+        # Acumuladores de tokens: LOCALES a este run(), re-inicializados en None
+        # en cada llamada — NO se mueven a self._* aunque el resto del método sí
+        # se volvió estatal. AgentResult.input_tokens/output_tokens documentan
+        # "totales de ESTA llamada a run()", no un acumulado de toda la sesión;
+        # estatalizarlos junto con el contexto rompería test_token_accounting en
+        # cuanto se invoque run() más de una vez sobre la misma instancia (CTX-02).
         total_input: int | None = None
         total_output: int | None = None
 
         for _ in range(self._max_iterations):
+            # CTX-01: el tope de max_history_messages debe respetarse en TODA
+            # llamada a chat(), no solo en la primera del turno — por eso
+            # handle_context() se invoca dentro del for, en cada iteración,
+            # nunca una sola vez antes del loop. self._context nunca se acota
+            # in-place: handle_context devuelve la sublista a enviar, y la
+            # memoria completa queda intacta para la próxima iteración/run().
+            bounded = self._context_policy.handle_context(
+                self._context, self._max_history_messages
+            )
             resp = self._llm.chat(
-                messages=messages,
+                messages=bounded,
                 tools=list(self._schemas.values()) if self._schemas else None,
                 system=self._system,
             )
@@ -128,7 +156,7 @@ class MyAgent:
             # Se agrega el turno del asistente con tool_calls serializados al formato dict que espera
             # _normalize_messages del scaffold: {"id": ..., "function": {"name": ..., "arguments": ...}}.
             # Pasar objetos ToolCall directamente falla porque el scaffold llama .get() sobre cada elemento.
-            messages.append({
+            self._context.append({
                 "role": "assistant",
                 "content": resp.content,
                 "tool_calls": [
@@ -159,7 +187,7 @@ class MyAgent:
                     ))
 
                 # Se vuelca el resultado para que el LLM pueda razonar sobre él en el próximo turno.
-                messages.append({"role": "tool", "content": tool_output, "tool_call_id": tool_call.id})
+                self._context.append({"role": "tool", "content": tool_output, "tool_call_id": tool_call.id})
 
         # Se alcanzó max_iterations sin respuesta de texto — se retorna lo que hay en lugar de loopear indefinidamente.
         return AgentResult(answer="", steps=steps, input_tokens=total_input, output_tokens=total_output)
