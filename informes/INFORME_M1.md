@@ -186,7 +186,87 @@ if tool_call.name not in self._tools:
 
 ---
 
-## 4. Limitaciones conocidas
+## 4. Herramienta de elección libre: `unit_converter`
+
+La tercera herramienta convierte valores numéricos entre unidades de la misma categoría física: longitud, masa, tiempo y temperatura.
+
+### 4.1 Motivación y criterios de selección
+
+Se eligió un conversor de unidades porque:
+
+- Cubre un caso de uso real y verificable (el LLM puede comparar el resultado con su propio conocimiento).
+- Requiere manejo explícito de categorías incompatibles (km → kg debe rechazarse), lo que ejercita la lógica de validación y el retorno de errores como `str`.
+- La temperatura introduce una conversión **no lineal** (Celsius/Fahrenheit/Kelvin), que demuestra que la herramienta puede contener lógica de dominio no trivial.
+
+### 4.2 Diseño: unidad canónica
+
+En lugar de mantener una matriz N×N de pares de conversión, cada unidad almacena dos factores respecto a una unidad **canónica** de su categoría:
+
+| Categoría | Canónico | Ejemplo de entrada |
+|---|---|---|
+| Longitud | metro (`m`) | `km` → × 1 000 → `m` |
+| Masa | kilogramo (`kg`) | `lb` → × 0.453592 → `kg` |
+| Tiempo | segundo (`s`) | `h` → × 3 600 → `s` |
+| Temperatura | Celsius (`C`) | conversión no lineal, ver §4.3 |
+
+La conversión de cualquier unidad A a cualquier unidad B se hace en dos pasos:
+
+```
+valor_A × factor(A→canónico) × factor(canónico→B)
+```
+
+Esto reduce la complejidad de O(N²) pares a O(N) entradas. Agregar una unidad nueva es una línea en el diccionario correspondiente; la lógica de despacho no cambia.
+
+### 4.3 Temperatura: conversión no lineal
+
+Las conversiones entre Celsius, Fahrenheit y Kelvin no son multiplicaciones simples. La función `_convertir_temperatura` las maneja en dos pasos explícitos:
+
+```python
+# Paso 1: valor de origen → Celsius (canónico de temperatura)
+if origen == "F":
+    celsius = (valor - 32) * 5 / 9
+elif origen == "K":
+    celsius = valor - 273.15
+else:
+    celsius = valor   # ya está en Celsius
+
+# Paso 2: Celsius → destino
+if destino == "F":
+    return celsius * 9 / 5 + 32
+if destino == "K":
+    return celsius + 273.15
+return celsius
+```
+
+La temperatura se trata por separado antes de ingresar a la tabla lineal, lo que mantiene ambos caminos limpios y sin condiciones mezcladas.
+
+### 4.4 Validación de categoría por identidad de objeto
+
+La herramienta detecta mezclas de categoría (ej: `km` → `kg`) comparando la identidad del diccionario al que pertenece cada unidad:
+
+```python
+_TABLA: dict[str, dict] = {u: d for d in (_LONGITUD, _MASA, _TIEMPO) for u in d}
+
+if _TABLA[from_unit] is not _TABLA[to_unit]:
+    return "Error: categorías distintas — no se puede convertir entre ellas."
+```
+
+`_LONGITUD`, `_MASA` y `_TIEMPO` son objetos distintos en memoria. Si `from_unit` y `to_unit` apuntan al mismo objeto `is` devuelve `True`; si apuntan a objetos distintos, son categorías incompatibles. No se compara por nombre de cadena ni por enum, lo que elimina la posibilidad de falsos positivos por typos o aliasing.
+
+### 4.5 Contratos de la herramienta
+
+| Condición | Retorno |
+|---|---|
+| Conversión válida | `str(round(resultado, 6))` |
+| Unidad no reconocida | `"Error: unidad '...' no reconocida. Unidades válidas: ..."` |
+| Categorías distintas | `"Error: '...' y '...' pertenecen a categorías distintas — ..."` |
+| Temperatura mezclada con lineal | `"Error: '...' no es una unidad de temperatura. ..."` |
+
+Todos los errores se retornan como `str`, nunca como excepciones, para que el agente pueda incluirlos en el historial de mensajes y el LLM pueda corregir su próxima llamada.
+
+---
+
+## 5. Limitaciones conocidas
 
 ### Sin memoria entre llamadas a `run`
 
